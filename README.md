@@ -16,6 +16,9 @@ The server listens on this computer only.
 ### Connecting an MCP client
 
 ```bash
+# Codex
+codex mcp add ida-mcp --url http://127.0.0.1:13337/mcp
+
 # Claude Code
 claude mcp add --transport http ida-mcp http://127.0.0.1:13337/mcp
 ```
