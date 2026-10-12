@@ -242,6 +242,10 @@ void McpHttpServer::setup_routes() {
     server_->Post("/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         // CORS
         std::string origin = req.get_header_value("Origin");
+        if (!origin.empty() && !is_cors_allowed(origin)) {
+            res.status = 403;
+            return;
+        }
         if (is_cors_allowed(origin)) {
             res.set_header("Access-Control-Allow-Origin", origin);
         }
@@ -330,6 +334,10 @@ void McpHttpServer::setup_routes() {
     // ── POST /sse?session=X (SSE request) ───────────────────────
     server_->Post("/sse", [this](const httplib::Request& req, httplib::Response& res) {
         std::string origin = req.get_header_value("Origin");
+        if (!origin.empty() && !is_cors_allowed(origin)) {
+            res.status = 403;
+            return;
+        }
         if (is_cors_allowed(origin)) {
             res.set_header("Access-Control-Allow-Origin", origin);
         }
