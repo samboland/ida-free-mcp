@@ -16,6 +16,8 @@
 #endif
 
 #include <string>
+#include <mutex>
+#include <thread>
 
 using namespace mcp;
 
@@ -206,7 +208,7 @@ static bool read_pseudocode_via_places(TWidget *w,
     return true;
 }
 
-static json tool_decompile(const json& params) {
+static json start_decompile(const json& params) {
     std::string addr_str = params.value("addr", "");
 
     try {
@@ -259,17 +261,8 @@ static json tool_decompile(const json& params) {
             };
         }
 
-        // Steps 3+4: Find the pseudocode widget showing THIS function and read it.
-        //
-        // On IDA Pro, Method A (vdui_t/cfunc probe) validates by cfunc_t::entry_ea.
-        // IDA Free's cloud decompiler (hexcx) does NOT populate cfunc_t/vdui_t, so
-        // there we must read the widget text (Method B) and validate that it belongs
-        // to our function. Validate the *declaration line only* (issue #6): checking
-        // for the name anywhere in the text also matches a stale widget of a caller,
-        // because the call site contains the callee's name. The pseudocode may show
-        // the raw name or a demangled name, so match against both. The cloud
-        // decompile is asynchronous, so we retry briefly to let the freshly
-        // generated pseudocode land in the widget.
+        // Keep the function names for later polling. Cloud decompilation needs
+        // the UI thread to run after this action returns.
         qstring fname;
         get_func_name(&fname, pfn->start_ea);
 
@@ -290,52 +283,10 @@ static json tool_decompile(const json& params) {
             (candidates.empty() || candidates[0] != demangled))
             candidates.push_back(demangled);
 
-        for (int attempt = 0; attempt < 40; attempt++) {
-            for (char c = 'A'; c <= 'Z'; c++) {
-                char buf[32];
-                qsnprintf(buf, sizeof(buf), "Pseudocode-%c", c);
-                TWidget *w = find_widget(buf);
-                if (!w) continue;
-
-                // Method A: cfunc probe (IDA Pro — self-validates entry_ea).
-                std::string pseudocode;
-                int line_count = 0;
-                if (read_pseudocode_via_vdui(w, pfn->start_ea, pseudocode, line_count)) {
-                    return {
-                        {"addr", utils::hex_str(pfn->start_ea)},
-                        {"pseudocode", pseudocode}, {"lines", line_count}, {"ok", true},
-                    };
-                }
-
-                // Method B: text iteration (IDA Free). Accept only if the
-                // declaration line of the text declares this function, so a
-                // stale widget (e.g. showing a caller of this function) is
-                // skipped and the retry loop waits for fresh output.
-                std::string t;
-                int tl = 0;
-                if (read_pseudocode_via_places(w, t, tl)) {
-                    std::string decl = utils::pseudocode_decl_line(t);
-                    bool declares = false;
-                    for (const std::string& cand : candidates) {
-                        if (utils::line_declares_function(decl, cand)) {
-                            declares = true;
-                            break;
-                        }
-                    }
-                    if (declares) {
-                        return {
-                            {"addr", utils::hex_str(pfn->start_ea)},
-                            {"pseudocode", t}, {"lines", tl}, {"ok", true},
-                        };
-                    }
-                }
-            }
-            qsleep(50); // let the async cloud decompile populate the widget, then retry
-        }
-
         return {
-            {"addr", utils::hex_str(pfn->start_ea)}, {"ok", false},
-            {"error", "No pseudocode widget for this function after decompilation"},
+            {"addr", utils::hex_str(pfn->start_ea)},
+            {"candidates", candidates},
+            {"started", true},
         };
 
     } catch (const std::exception& e) {
@@ -344,6 +295,76 @@ static json tool_decompile(const json& params) {
             {"error", std::string("Exception: ") + e.what()},
         };
     }
+}
+
+static json poll_decompile(const json& state) {
+    ea_t func_ea = utils::parse_address(state.at("addr").get<std::string>());
+    const auto candidates = state.at("candidates").get<std::vector<std::string>>();
+
+    // On IDA Pro, Method A validates cfunc_t::entry_ea. IDA Free does not
+    // populate cfunc_t, so Method B checks only the declaration line.
+    for (char c = 'A'; c <= 'Z'; c++) {
+        char buf[32];
+        qsnprintf(buf, sizeof(buf), "Pseudocode-%c", c);
+        TWidget *w = find_widget(buf);
+        if (!w) continue;
+
+        // Method A: cfunc probe (IDA Pro — self-validates entry_ea).
+        std::string pseudocode;
+        int line_count = 0;
+        if (read_pseudocode_via_vdui(w, func_ea, pseudocode, line_count)) {
+            return {
+                {"addr", state.at("addr")},
+                {"pseudocode", pseudocode}, {"lines", line_count}, {"ok", true},
+            };
+        }
+
+        // Method B: text iteration (IDA Free). Accept only if the
+        // declaration line of the text declares this function, so a
+        // stale widget (e.g. showing a caller of this function) is
+        // skipped and the retry loop waits for fresh output.
+        std::string t;
+        int tl = 0;
+        if (read_pseudocode_via_places(w, t, tl)) {
+            std::string decl = utils::pseudocode_decl_line(t);
+            bool declares = false;
+            for (const std::string& cand : candidates) {
+                if (utils::line_declares_function(decl, cand)) {
+                    declares = true;
+                    break;
+                }
+            }
+            if (declares) {
+                return {
+                    {"addr", state.at("addr")},
+                    {"pseudocode", t}, {"lines", tl}, {"ok", true},
+                };
+            }
+        }
+    }
+    return nullptr;
+}
+
+static json tool_decompile(const json& params) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    json state = idasync::execute_on_main_thread(
+        [&params]() { return start_decompile(params); }, nullptr, 60.0);
+    if (!state.value("started", false)) return state;
+
+    // Sleep on the MCP worker thread, leaving IDA's UI thread free to receive
+    // the cloud result. Each poll enters the UI thread only to read the widget.
+    for (int attempt = 0; attempt < 450; attempt++) {
+        json result = idasync::execute_on_main_thread(
+            [&state]() { return poll_decompile(state); }, nullptr, 60.0);
+        if (!result.is_null()) return result;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return {
+        {"addr", state.at("addr")}, {"ok", false},
+        {"error", "No pseudocode widget for this function after decompilation"},
+    };
 }
 
 #endif // !IDA_MCP_TESTING
@@ -375,7 +396,7 @@ void register_decompiler_tools(McpProtocol& mcp) {
          SchemaBuilder()
              .string_prop("addr", "Function address (hex or decimal)")
              .build()},
-        ida_sync_tool(tool_decompile, 60.0)
+        tool_decompile
     );
 #endif
 }
